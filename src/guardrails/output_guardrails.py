@@ -36,24 +36,49 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
+    source = response or ""
     issues = []
-    redacted = response
+    match_spans = []
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+    # Patterns cover the formats named in the lab plus the demo DB host and
+    # standalone demo password, so an unlabeled secret is also removed.
+    pii_patterns = {
+        "phone": r"(?<!\d)(?:\+?84|0)(?:[\s().-]*\d){9,10}(?!\d)",
+        "email": r"(?<![\w.+-])[\w.+-]+@(?:[\w-]+\.)+[A-Za-z]{2,}(?![\w.-])",
+        "national_id": r"(?<!\d)(?:\d{9}|\d{12})(?!\d)",
+        "api_key": r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{3,}\b",
+        "password": (
+            r"(?:\b(?:admin\s+)?password\b\s*(?:is|are|equals?|:|=)|"
+            r"\bmật\s*khẩu\b\s*(?:là|:|=))\s*"
+            r"(?:\"[^\"]+\"|'[^']+'|[^\s,;.!?]+)"
+        ),
+        "lab_password": r"\badmin123\b",
+        "database_host": r"\b(?:[a-z0-9-]+\.)+internal(?::\d{1,5})?\b",
     }
 
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+    for name, pattern in pii_patterns.items():
+        matches = list(re.finditer(pattern, source, re.IGNORECASE))
         if matches:
             issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+            match_spans.extend((match.start(), match.end()) for match in matches)
+
+    # Merge overlaps (for example, a phone-like number that also matches the
+    # generic 9/12 digit national-ID rule), then redact from the original text.
+    merged_spans = []
+    for start, end in sorted(match_spans):
+        if merged_spans and start <= merged_spans[-1][1]:
+            merged_spans[-1] = (merged_spans[-1][0], max(merged_spans[-1][1], end))
+        else:
+            merged_spans.append((start, end))
+
+    redacted_parts = []
+    cursor = 0
+    for start, end in merged_spans:
+        redacted_parts.append(source[cursor:start])
+        redacted_parts.append("[REDACTED]")
+        cursor = end
+    redacted_parts.append(source[cursor:])
+    redacted = "".join(redacted_parts)
 
     return {
         "safe": len(issues) == 0,
@@ -153,11 +178,21 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
         text = ""
-        if hasattr(llm_response, "content") and llm_response.content:
-            for part in llm_response.content.parts:
-                if hasattr(part, "text") and part.text:
-                    text += part.text
+        content = getattr(llm_response, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            if getattr(part, "text", None):
+                text += part.text
         return text
+
+    def _replace_response_text(self, llm_response, text: str):
+        """Replace the response body while preserving the response object."""
+        content = getattr(llm_response, "content", None)
+        role = getattr(content, "role", None) or "model"
+        llm_response.content = types.Content(
+            role=role,
+            parts=[types.Part.from_text(text=text)],
+        )
+        return llm_response
 
     async def after_model_callback(
         self,
@@ -172,16 +207,29 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filter_result = content_filter(response_text)
+        safe_text = filter_result["redacted"]
+        if filter_result["issues"]:
+            self.redacted_count += 1
+            self._replace_response_text(llm_response, safe_text)
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            try:
+                judge_result = await llm_safety_check(safe_text)
+                is_safe = bool(judge_result.get("safe"))
+            except Exception:
+                # A judge failure must not let an unchecked model response pass.
+                is_safe = False
+
+            if not is_safe:
+                self.blocked_count += 1
+                self._replace_response_text(
+                    llm_response,
+                    "I cannot provide that response. I can help with general "
+                    "VinBank banking questions.",
+                )
+
+        return llm_response
 
 
 # ============================================================

@@ -1,5 +1,5 @@
 """
-Assignment 11 — Monitoring & Alerts starter (TODO).
+Assignment 11 — Monitoring counters and threshold alerts.
 
 Tracks block rate, rate-limit hits, judge fail rate.
 Fires alerts when thresholds are exceeded.
@@ -42,16 +42,68 @@ class MonitoringAlert:
     judge_fails: int = 0
 
     def check_metrics(self) -> list[Alert]:
-        """TODO: compute rates, append Alert objects when thresholds exceeded."""
-        raise NotImplementedError("Implement MonitoringAlert.check_metrics")
+        """Refresh alerts for any metric that exceeds its configured threshold."""
+        snapshot = self.snapshot()
+        alerts = []
+
+        if snapshot["block_rate"] > self.block_rate_threshold:
+            alerts.append(
+                Alert(
+                    metric="block_rate",
+                    value=snapshot["block_rate"],
+                    threshold=self.block_rate_threshold,
+                    message=(
+                        f"Block rate {snapshot['block_rate']:.1%} exceeded "
+                        f"threshold {self.block_rate_threshold:.1%}."
+                    ),
+                )
+            )
+
+        if self.rate_limit_hits > self.rate_limit_hit_threshold:
+            alerts.append(
+                Alert(
+                    metric="rate_limit_hits",
+                    value=float(self.rate_limit_hits),
+                    threshold=float(self.rate_limit_hit_threshold),
+                    message=(
+                        f"Rate-limit hits {self.rate_limit_hits} exceeded "
+                        f"threshold {self.rate_limit_hit_threshold}."
+                    ),
+                )
+            )
+
+        if (
+            snapshot["judge_fail_rate"] > self.judge_fail_rate_threshold
+            and self.judge_checks > 0
+        ):
+            alerts.append(
+                Alert(
+                    metric="judge_fail_rate",
+                    value=snapshot["judge_fail_rate"],
+                    threshold=self.judge_fail_rate_threshold,
+                    message=(
+                        f"Judge fail rate {snapshot['judge_fail_rate']:.1%} exceeded "
+                        f"threshold {self.judge_fail_rate_threshold:.1%}."
+                    ),
+                )
+            )
+
+        self.alerts = alerts
+        return list(self.alerts)
 
     def export_json(self, filepath: str | None = None):
-        """TODO: write metrics + alerts to JSON under repo-root ``outputs/`` by default.
+        """Write metrics + alerts to JSON under repo-root ``outputs/`` by default.
         Use ``filepath or default_metrics_path()`` so running from ``src/`` does not
         create ``src/outputs/``.
         """
-        _ = filepath or default_metrics_path()
-        raise NotImplementedError("Implement MonitoringAlert.export_json")
+        path = Path(filepath or default_metrics_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.check_metrics()
+        path.write_text(
+            json.dumps(self.snapshot(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return str(path)
 
     def snapshot(self) -> dict:
         block_rate = (

@@ -45,13 +45,20 @@ class OpenAIRunner:
     client_kwargs: dict = field(default_factory=dict)
     input_hooks: list[Callable[[str], str | None]] = field(default_factory=list)
     output_hooks: list[Callable[[str], str]] = field(default_factory=list)
+    user_id: str = "student"
+    conversations: dict[str, list[dict[str, str]]] = field(default_factory=dict)
 
     def _client(self):
         from openai import OpenAI
 
         return OpenAI(**(self.client_kwargs or {}))
 
-    async def chat(self, agent: OpenAIAgent, user_message: str) -> str:
+    async def chat(
+        self,
+        agent: OpenAIAgent,
+        user_message: str,
+        session_id: str | None = None,
+    ) -> str:
         for hook in self.input_hooks:
             blocked = hook(user_message)
             if blocked:
@@ -62,12 +69,32 @@ class OpenAIRunner:
             return block_msg
 
         client = self._client()
-        completion = client.chat.completions.create(
-            model=self.model,
-            messages=[
+        request_model = self.model
+        # OpenRouter currently exposes the lab's locked Liquid model through
+        # its free variant slug. Keep ``self.model`` as the rubric's canonical
+        # model name, and add the routing variant only for the API request.
+        if (
+            self.provider == "openrouter"
+            and self.model == "liquid/lfm-2.5-2.6b"
+        ):
+            request_model = f"{self.model}:free"
+
+        if session_id is None:
+            messages = [
                 {"role": "system", "content": agent.instruction},
                 {"role": "user", "content": user_message},
-            ],
+            ]
+            conversation = None
+        else:
+            conversation = self.conversations.setdefault(
+                session_id, [{"role": "system", "content": agent.instruction}]
+            )
+            conversation.append({"role": "user", "content": user_message})
+            messages = conversation
+
+        completion = client.chat.completions.create(
+            model=request_model,
+            messages=messages,
             temperature=self.temperature,
         )
         text = (completion.choices[0].message.content or "").strip()
@@ -76,6 +103,8 @@ class OpenAIRunner:
             text = hook(text)
 
         text = await self._run_output_plugins(text)
+        if conversation is not None:
+            conversation.append({"role": "assistant", "content": text})
         return text
 
     async def _run_input_plugins(self, user_message: str) -> str | None:
@@ -90,7 +119,7 @@ class OpenAIRunner:
             role="user",
             parts=[types.Part.from_text(text=user_message)],
         )
-        ctx = _MockInvocationContext()
+        ctx = _MockInvocationContext(user_id=self.user_id or "student")
         for plugin in self.plugins:
             cb = getattr(plugin, "on_user_message_callback", None)
             if cb is None:

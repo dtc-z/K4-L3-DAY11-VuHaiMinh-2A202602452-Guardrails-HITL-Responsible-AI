@@ -12,7 +12,7 @@ async def chat_with_agent(agent, runner, user_message: str, session_id=None):
     """
     provider = getattr(runner, "provider", None)
     if isinstance(runner, OpenAIRunner) or provider in ("openrouter", "openai"):
-        text = await runner.chat(agent, user_message)
+        text = await runner.chat(agent, user_message, session_id=session_id)
         return text, None
 
     from google.genai import types
